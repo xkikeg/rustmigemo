@@ -78,11 +78,17 @@ impl<'a> Reader<'a> {
     }
 
     fn trie(&mut self, compact_hiragana: bool) -> Result<LoudsTrie, DictionaryError> {
+        let mut has_encoded_chouon = false;
         let edges: Vec<u16> = if compact_hiragana {
             let n = self.count(1, "key trie edges")?;
             self.take(n, "key trie edges")?
                 .iter()
-                .map(|&b| CompactDictionary::decode(b))
+                .map(|&b| {
+                    if b == 0xF7 {
+                        has_encoded_chouon = true;
+                    }
+                    CompactDictionary::decode(b)
+                })
                 .collect()
         } else {
             let n = self.count(2, "value trie edges")?;
@@ -92,10 +98,50 @@ impl<'a> Reader<'a> {
                 .collect()
         };
         let bit_vector = self.bit_vector("trie bit vector")?;
-        let trie = LoudsTrie { bit_vector, edges };
-        trie.validate().map_err(DictionaryError::Invalid)?;
+        let mut trie = LoudsTrie { bit_vector, edges };
+        trie.validate_structure().map_err(DictionaryError::Invalid)?;
+        if compact_hiragana && !has_encoded_chouon {
+            repair_legacy_chouon(&mut trie);
+        }
+        trie.validate_edges_sorted().map_err(DictionaryError::Invalid)?;
         Ok(trie)
     }
+}
+
+/// Legacy dictionaries built before the 0xF7 encoding for 'ー' (U+30FC) truncated it
+/// to `((0x30FC - 0x3040 + 0xA0) as u8) == 0x5C` ('\\'). Since 'ー' sorts after all
+/// ASCII and hiragana, it always sits at the end of its sibling block, which breaks
+/// `binary_search` in `LoudsTrie::traverse` and makes keys containing 'ー' unsearchable.
+/// Rewrite those trailing 0x5C edges back to U+30FC in BFS order.
+fn repair_legacy_chouon(trie: &mut LoudsTrie) {
+    let mut ones = 0usize;
+    let mut zeros = 0usize;
+    let mut block_len = 0usize;
+
+    let flush_block = |edges: &mut [u16], parent: usize, last_child: usize, len: usize| {
+        if len == 0 || edges[last_child] != 0x005C {
+            return;
+        }
+        let preceded_by_ge_backslash = len >= 2 && edges[last_child - 1] >= 0x005C;
+        let parent_is_non_ascii = parent > 1 && edges[parent] >= 0x0080;
+        if preceded_by_ge_backslash || parent_is_non_ascii {
+            edges[last_child] = 0x30FC;
+        }
+    };
+
+    for pos in 0..trie.bit_vector.size() {
+        if trie.bit_vector.get(pos) {
+            ones += 1;
+            if ones >= 2 {
+                block_len += 1;
+            }
+        } else {
+            flush_block(&mut trie.edges, zeros, ones, block_len);
+            zeros += 1;
+            block_len = 0;
+        }
+    }
+    flush_block(&mut trie.edges, zeros, ones, block_len);
 }
 
 #[derive(Debug)]
@@ -410,6 +456,87 @@ mod tests {
         assert_eq!(
             CompactDictionary::try_new(&buf).unwrap_err(),
             DictionaryError::Invalid("mapping bit vector must start with 0")
+        );
+    }
+
+    #[test]
+    fn legacy_chouon_dictionary_is_repaired_on_load() {
+        use crate::migemo::compact_dictionary_builder::build;
+        use crate::migemo::query::query;
+        use crate::migemo::regex_generator::RegexOperator;
+        use std::collections::HashMap;
+
+        let mut entries = HashMap::new();
+        entries.insert("けんさく".to_string(), vec!["検索".to_string(), "研削".to_string()]);
+        entries.insert("けーす".to_string(), vec!["ケース".to_string()]);
+        entries.insert("こーひー".to_string(), vec!["コーヒー".to_string(), "珈琲".to_string()]);
+        entries.insert("あーー".to_string(), vec!["長音連続".to_string()]);
+        entries.insert("ー".to_string(), vec!["長音".to_string()]);
+        entries.insert("a\\b".to_string(), vec!["backslash".to_string()]);
+
+        let modern_buf = build(entries);
+        // Simulate a legacy dictionary built before 0xF7 was introduced:
+        // rewrite every 0xF7 in the key trie edge array to 0x5C ('\\').
+        let mut legacy_buf = modern_buf.clone();
+        let edge_count = u32::from_be_bytes(legacy_buf[0..4].try_into().unwrap()) as usize;
+        let mut replaced = 0usize;
+        for b in &mut legacy_buf[4..4 + edge_count] {
+            if *b == 0xF7 {
+                *b = 0x5C;
+                replaced += 1;
+            }
+        }
+        assert!(replaced > 0);
+
+        for buf in [&modern_buf, &legacy_buf] {
+            let dict = CompactDictionary::try_new(buf).unwrap();
+            let kensaku = query("kensaku".to_string(), &dict, &RegexOperator::Default);
+            assert!(kensaku.contains("検索"), "missing 検索 in {}", kensaku);
+            assert!(kensaku.contains("研削"), "missing 研削 in {}", kensaku);
+
+            let search_str = |k: &str| -> Vec<String> {
+                let u16s: Vec<u16> = k.encode_utf16().collect();
+                dict.search(&u16s).map(|v| String::from_utf16(&v).unwrap()).collect()
+            };
+            assert_eq!(search_str("けーす"), vec!["ケース"]);
+            assert_eq!(search_str("こーひー"), vec!["コーヒー", "珈琲"]);
+            assert_eq!(search_str("あーー"), vec!["長音連続"]);
+            assert_eq!(search_str("ー"), vec!["長音"]);
+            assert_eq!(search_str("a\\b"), vec!["backslash"]);
+        }
+    }
+
+    #[test]
+    fn modern_dictionary_preserves_literal_backslash_under_kana() {
+        use crate::migemo::compact_dictionary_builder::build;
+        use std::collections::HashMap;
+
+        let mut entries = HashMap::new();
+        entries.insert("あ\\".to_string(), vec!["バックスラッシュ".to_string()]);
+        entries.insert("こーひー".to_string(), vec!["珈琲".to_string()]);
+
+        let buf = build(entries);
+        let dict = CompactDictionary::try_new(&buf).unwrap();
+        let key: Vec<u16> = "あ\\".encode_utf16().collect();
+        let vals: Vec<String> = dict.search(&key).map(|v| String::from_utf16(&v).unwrap()).collect();
+        assert_eq!(vals, vec!["バックスラッシュ"]);
+    }
+
+    #[test]
+    fn try_new_rejects_unsorted_key_edges() {
+        use crate::migemo::compact_dictionary_builder::build;
+        use std::collections::HashMap;
+
+        let mut entries = HashMap::new();
+        entries.insert("あ".to_string(), vec!["亜".to_string()]);
+        entries.insert("い".to_string(), vec!["伊".to_string()]);
+
+        let mut buf = build(entries);
+        // Key edges are [0x20, 0x20, 'あ', 'い']; swap 'あ' and 'い'.
+        buf.swap(6, 7);
+        assert_eq!(
+            CompactDictionary::try_new(&buf).unwrap_err(),
+            DictionaryError::Invalid("trie sibling edges are not sorted")
         );
     }
 

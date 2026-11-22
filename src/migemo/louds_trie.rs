@@ -199,6 +199,11 @@ impl LoudsTrie {
     /// Checks the structural invariants that the lookup methods rely on, so that a
     /// trie read from untrusted bytes cannot cause panics or infinite loops later.
     pub fn validate(&self) -> Result<(), &'static str> {
+        self.validate_structure()?;
+        self.validate_edges_sorted()
+    }
+
+    pub(crate) fn validate_structure(&self) -> Result<(), &'static str> {
         let nodes = self.edges.len();
         if nodes < 2 {
             return Err("trie has no root node");
@@ -223,6 +228,30 @@ impl LoudsTrie {
                 }
             } else {
                 zeros += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks that every sibling block's edges are sorted, as required by
+    /// `binary_search` in [`LoudsTrie::traverse`].
+    pub(crate) fn validate_edges_sorted(&self) -> Result<(), &'static str> {
+        let mut ones = 0usize;
+        let mut prev_edge: Option<u16> = None;
+        for pos in 0..self.bit_vector.size() {
+            if self.bit_vector.get(pos) {
+                ones += 1;
+                if ones >= 2 {
+                    let edge = self.edges[ones];
+                    if let Some(prev) = prev_edge {
+                        if prev > edge {
+                            return Err("trie sibling edges are not sorted");
+                        }
+                    }
+                    prev_edge = Some(edge);
+                }
+            } else {
+                prev_edge = None;
             }
         }
         Ok(())
@@ -360,6 +389,17 @@ mod tests {
             edges: vec![0x20, 97, 98],
         };
         assert!(trie.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_unsorted_siblings() {
+        // Root has two children 'b' (98) then 'a' (97): breaks binary_search in traverse().
+        let trie = LoudsTrie {
+            bit_vector: BitVector::new(vec![0b00_1101], 6),
+            edges: vec![0x20, 0x20, 98, 97],
+        };
+        assert!(trie.validate_structure().is_ok());
+        assert_eq!(trie.validate(), Err("trie sibling edges are not sorted"));
     }
 
     #[test]
