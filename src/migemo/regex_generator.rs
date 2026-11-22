@@ -66,7 +66,7 @@ impl RegexOperatorDetail {
                 end_group: "\\)".to_string(),
                 begin_class: "[".to_string(),
                 end_class: "]".to_string(),
-                newline: "\\_s-*".to_string(),
+                newline: "\\s-*".to_string(),
             },
             RegexOperator::EmacsNonNewline => RegexOperatorDetail {
                 or: "\\|".to_string(),
