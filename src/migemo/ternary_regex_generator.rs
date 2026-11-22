@@ -79,7 +79,11 @@ fn insert(word: &[char], offset: usize, t: Option<Box<TernaryRegexNode>>) -> Opt
                 tt.right = insert(word, offset, tt.right)
             } else {
                 if tt.child.is_some() {
-                    tt.child = insert(word, offset + 1, tt.child);
+                    if offset + 1 == word.len() {
+                        tt.child = None;
+                    } else {
+                        tt.child = insert(word, offset + 1, tt.child);
+                    }
                 }
                 return Some(tt);
             };
@@ -96,32 +100,6 @@ fn traverse_siblings<'a>(node: &'a Option<Box<TernaryRegexNode>>, buffer: &mut V
             buffer.push(n);
             traverse_siblings(&n.right, buffer);
         }
-    }
-}
-
-const ESCAPE_BITMAP: [u64; 2] = generate_escape_bitmap();
-
-const fn generate_escape_bitmap() -> [u64; 2] {
-    const ESCAPE_CHARS: &str = r"()[]{}?*+|^$.\";
-    let mut bitmap = [0u64; 2];
-    let bytes = ESCAPE_CHARS.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let byte = bytes[i];
-        let c = byte as u64;
-        if c < 128 {
-            bitmap[(c / 64) as usize] |= 1 << (c % 64);
-        }
-        i += 1;
-    }
-    bitmap
-}
-
-fn is_characters_to_escape(c: char) -> bool {
-    if c < '\u{80}' {
-        return (ESCAPE_BITMAP[(c as usize) / 64] >> ((c as u64) % 64)) & 1 == 1;
-    } else {
-        return false;
     }
 }
 
@@ -142,19 +120,14 @@ fn generate(node: &Option<Box<TernaryRegexNode>>, buffer: &mut String, op: &Rege
     }
     if nochild > 0 {
         if nochild > 1 {
-            buffer.push_str(&op.begin_class);
-        }
-        for n in &siblings {
-            if n.child.is_some() {
-                continue;
+            op.write_char_class(siblings.iter().filter(|n| n.child.is_none()).map(|n| n.code), buffer);
+        } else {
+            for n in &siblings {
+                if n.child.is_none() {
+                    op.write_escaped_char(n.code, buffer);
+                    break;
+                }
             }
-            if is_characters_to_escape(n.code) {
-                buffer.push('\\');
-            }
-            buffer.push(n.code);
-        }
-        if nochild > 1 {
-            buffer.push_str(&op.end_class);
         }
     }
     if haschild > 0 {
@@ -167,10 +140,7 @@ fn generate(node: &Option<Box<TernaryRegexNode>>, buffer: &mut String, op: &Rege
                 if !is_first {
                     buffer.push_str(&op.or);
                 }
-                if is_characters_to_escape(n.code) {
-                    buffer.push('\\');
-                }
-                buffer.push(n.code);
+                op.write_escaped_char(n.code, buffer);
                 if !op.newline.is_empty() {
                     buffer.push_str(&op.newline);
                 }

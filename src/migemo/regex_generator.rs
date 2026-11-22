@@ -7,6 +7,10 @@ pub struct RegexNode {
     pub next: Option<Box<RegexNode>>,
 }
 
+pub const DEFAULT_ESCAPE_CHARS: &str = r"\.[]{}()*+?^$|";
+pub const VIM_ESCAPE_CHARS: &str = r"\.[]*~^$/";
+pub const EMACS_ESCAPE_CHARS: &str = r"\.[]*+?^$";
+
 pub enum RegexOperator {
     Default,
     Vim,
@@ -20,10 +24,11 @@ pub enum RegexOperator {
         begin_class: String,
         end_class: String,
         newline: String,
+        escape: String,
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RegexOperatorDetail {
     pub or: String,
     pub begin_group: String,
@@ -31,51 +36,163 @@ pub struct RegexOperatorDetail {
     pub begin_class: String,
     pub end_class: String,
     pub newline: String,
+    pub escape: String,
+    escape_in_class: bool,
+    escape_ascii: [u64; 2],
+    has_non_ascii_escape: bool,
 }
 
 impl RegexOperatorDetail {
+    fn build(
+        or: String,
+        begin_group: String,
+        end_group: String,
+        begin_class: String,
+        end_class: String,
+        newline: String,
+        escape: String,
+        escape_in_class: bool,
+    ) -> RegexOperatorDetail {
+        let mut escape_ascii = [0u64; 2];
+        let mut has_non_ascii_escape = false;
+        for c in escape.chars() {
+            if c < '\u{80}' {
+                escape_ascii[(c as usize) >> 6] |= 1u64 << ((c as u32) & 63);
+            } else {
+                has_non_ascii_escape = true;
+            }
+        }
+        RegexOperatorDetail {
+            or,
+            begin_group,
+            end_group,
+            begin_class,
+            end_class,
+            newline,
+            escape,
+            escape_in_class,
+            escape_ascii,
+            has_non_ascii_escape,
+        }
+    }
+
+    #[inline]
+    pub fn needs_escape(&self, c: char) -> bool {
+        if c < '\u{80}' {
+            ((self.escape_ascii[(c as usize) >> 6] >> ((c as u32) & 63)) & 1) == 1
+        } else if self.has_non_ascii_escape {
+            self.escape.contains(c)
+        } else {
+            false
+        }
+    }
+
+    #[inline]
+    pub(crate) fn write_escaped_char(&self, c: char, buf: &mut String) {
+        if self.needs_escape(c) {
+            buf.push('\\');
+        }
+        buf.push(c);
+    }
+
+    /// Writes a character class (`[...]`) containing `chars` without introducing
+    /// unintended ranges, negation, or engine-specific backslash pitfalls.
+    pub(crate) fn write_char_class(&self, chars: impl Iterator<Item = char>, buf: &mut String) {
+        let mut has_rbracket = false;
+        let mut has_caret = false;
+        let mut has_dash = false;
+        let mut others = Vec::new();
+        for c in chars {
+            match c {
+                ']' => has_rbracket = true,
+                '^' => has_caret = true,
+                '-' => has_dash = true,
+                _ => others.push(c),
+            }
+        }
+
+        buf.push_str(&self.begin_class);
+        if has_rbracket {
+            if self.escape_in_class {
+                buf.push('\\');
+            }
+            buf.push(']');
+        }
+        for c in &others {
+            if self.escape_in_class && *c == '\\' {
+                buf.push('\\');
+            }
+            buf.push(*c);
+        }
+        if has_dash && !has_rbracket && others.is_empty() {
+            // Only '-' and '^' are in the class; emit '-' first so '^' does not negate.
+            buf.push('-');
+            if has_caret {
+                buf.push('^');
+            }
+        } else {
+            if has_caret {
+                buf.push('^');
+            }
+            if has_dash {
+                buf.push('-');
+            }
+        }
+        buf.push_str(&self.end_class);
+    }
+
     pub fn get_regex_operator_detail(rxop: &RegexOperator) -> RegexOperatorDetail {
-        return match rxop {
-            RegexOperator::Default => RegexOperatorDetail {
-                or: "|".to_string(),
-                begin_group: "(".to_string(),
-                end_group: ")".to_string(),
-                begin_class: "[".to_string(),
-                end_class: "]".to_string(),
-                newline: String::new(),
-            },
-            RegexOperator::Vim => RegexOperatorDetail {
-                or: "\\|".to_string(),
-                begin_group: "\\%(".to_string(),
-                end_group: "\\)".to_string(),
-                begin_class: "[".to_string(),
-                end_class: "]".to_string(),
-                newline: "\\_s*".to_string(),
-            },
-            RegexOperator::VimNonNewline => RegexOperatorDetail {
-                or: "\\|".to_string(),
-                begin_group: "\\%(".to_string(),
-                end_group: "\\)".to_string(),
-                begin_class: "[".to_string(),
-                end_class: "]".to_string(),
-                newline: String::new(),
-            },
-            RegexOperator::Emacs => RegexOperatorDetail {
-                or: "\\|".to_string(),
-                begin_group: "\\(".to_string(),
-                end_group: "\\)".to_string(),
-                begin_class: "[".to_string(),
-                end_class: "]".to_string(),
-                newline: "\\s-*".to_string(),
-            },
-            RegexOperator::EmacsNonNewline => RegexOperatorDetail {
-                or: "\\|".to_string(),
-                begin_group: "\\(".to_string(),
-                end_group: "\\)".to_string(),
-                begin_class: "[".to_string(),
-                end_class: "]".to_string(),
-                newline: String::new(),
-            },
+        match rxop {
+            RegexOperator::Default => RegexOperatorDetail::build(
+                "|".to_string(),
+                "(".to_string(),
+                ")".to_string(),
+                "[".to_string(),
+                "]".to_string(),
+                String::new(),
+                DEFAULT_ESCAPE_CHARS.to_string(),
+                true,
+            ),
+            RegexOperator::Vim => RegexOperatorDetail::build(
+                "\\|".to_string(),
+                "\\%(".to_string(),
+                "\\)".to_string(),
+                "[".to_string(),
+                "]".to_string(),
+                "\\_s*".to_string(),
+                VIM_ESCAPE_CHARS.to_string(),
+                true,
+            ),
+            RegexOperator::VimNonNewline => RegexOperatorDetail::build(
+                "\\|".to_string(),
+                "\\%(".to_string(),
+                "\\)".to_string(),
+                "[".to_string(),
+                "]".to_string(),
+                String::new(),
+                VIM_ESCAPE_CHARS.to_string(),
+                true,
+            ),
+            RegexOperator::Emacs => RegexOperatorDetail::build(
+                "\\|".to_string(),
+                "\\(".to_string(),
+                "\\)".to_string(),
+                "[".to_string(),
+                "]".to_string(),
+                "\\s-*".to_string(),
+                EMACS_ESCAPE_CHARS.to_string(),
+                false,
+            ),
+            RegexOperator::EmacsNonNewline => RegexOperatorDetail::build(
+                "\\|".to_string(),
+                "\\(".to_string(),
+                "\\)".to_string(),
+                "[".to_string(),
+                "]".to_string(),
+                String::new(),
+                EMACS_ESCAPE_CHARS.to_string(),
+                false,
+            ),
             RegexOperator::User {
                 or,
                 begin_group,
@@ -83,15 +200,18 @@ impl RegexOperatorDetail {
                 begin_class,
                 end_class,
                 newline,
-            } => RegexOperatorDetail {
-                or: or.clone(),
-                begin_group: begin_group.clone(),
-                end_group: end_group.clone(),
-                begin_class: begin_class.clone(),
-                end_class: end_class.clone(),
-                newline: newline.clone(),
-            },
-        };
+                escape,
+            } => RegexOperatorDetail::build(
+                or.clone(),
+                begin_group.clone(),
+                end_group.clone(),
+                begin_class.clone(),
+                end_class.clone(),
+                newline.clone(),
+                escape.clone(),
+                true,
+            ),
+        }
     }
 }
 
@@ -139,7 +259,7 @@ impl RegexGenerator {
             return Some(Box::new(RegexNode {
                 code: code,
                 child: RegexGenerator::_add(None, word, offset + 1),
-                next: ::std::mem::replace(&mut node.unwrap().next, None),
+                next: node,
             }));
         } else {
             fn find_le_node(node: &mut Box<RegexNode>, code: char) -> &mut Box<RegexNode> {
@@ -197,8 +317,6 @@ impl RegexGenerator {
     }
 
     fn generate_stub(&self, node: &Option<Box<RegexNode>>, operator: &RegexOperatorDetail, buf: &mut String) {
-        let mut escape_characters: Vec<char> = "\\.[]{}()*+-?^$|".chars().collect();
-        escape_characters.sort();
         let mut brother = 1;
         let mut haschild = 0;
         let mut tmp = node;
@@ -219,23 +337,24 @@ impl RegexGenerator {
         }
         if nochild > 0 {
             if nochild > 1 {
-                buf.push_str(&operator.begin_class);
-            }
-            let mut tmp = node;
-            while tmp.is_some() {
-                let tmp_unwrap = tmp.as_ref().unwrap();
-                if tmp_unwrap.child.is_some() {
-                    tmp = &tmp_unwrap.next;
-                    continue;
+                let mut chars = Vec::with_capacity(nochild);
+                let mut tmp = node;
+                while let Some(n) = tmp.as_ref() {
+                    if n.child.is_none() {
+                        chars.push(n.code);
+                    }
+                    tmp = &n.next;
                 }
-                if escape_characters.binary_search(&tmp_unwrap.code).is_ok() {
-                    buf.push('\\');
+                operator.write_char_class(chars.into_iter(), buf);
+            } else {
+                let mut tmp = node;
+                while let Some(n) = tmp.as_ref() {
+                    if n.child.is_none() {
+                        operator.write_escaped_char(n.code, buf);
+                        break;
+                    }
+                    tmp = &n.next;
                 }
-                buf.push(::std::char::from_u32(tmp_unwrap.code as u32).unwrap());
-                tmp = &tmp_unwrap.next;
-            }
-            if nochild > 1 {
-                buf.push_str(&operator.end_class);
             }
         }
 
@@ -248,10 +367,7 @@ impl RegexGenerator {
                 tmp = &tmp.as_ref().unwrap().next;
             }
             loop {
-                if escape_characters.binary_search(&tmp.as_ref().unwrap().code).is_ok() {
-                    buf.push('\\');
-                }
-                buf.push(tmp.as_ref().unwrap().code);
+                operator.write_escaped_char(tmp.as_ref().unwrap().code, buf);
                 if operator.newline.len() > 0 {
                     buf.push_str(&operator.newline);
                 }
