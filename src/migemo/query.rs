@@ -257,37 +257,217 @@ mod tests {
             begin_class: "[".to_string(),
             end_class: "]".to_string(),
             newline: "<NL>".to_string(),
+            escape: DEFAULT_ESCAPE_CHARS.to_string(),
         };
         let (user1, user2) = generate_with_both_generators(&["bad", "bat"], &user_op);
         assert_eq!(user1, user2);
         assert!(user2.contains("<NL>"));
+
+        // Special characters inside and outside character classes must match across generators.
+        let special_cases: &[&[&str]] = &[
+            &["A+", "A-", "Aー"],
+            &["a-", "a^"],
+            &["a]", "a\\"],
+            &["a]", "a\\", "a^", "a-"],
+            &["f(x)", "f(", "a+b", "a?b", "a{1}", "a|b", "a~b", "a/b"],
+            &["a(", "a)", "a+", "a?", "a{", "a}", "a|"],
+            &["ab", "a"],
+            &["b", "a"],
+        ];
+        let operators = [
+            RegexOperator::Default,
+            RegexOperator::Vim,
+            RegexOperator::VimNonNewline,
+            RegexOperator::Emacs,
+            RegexOperator::EmacsNonNewline,
+        ];
+        for op in &operators {
+            for words in special_cases {
+                let (g1, g2) = generate_with_both_generators(words, op);
+                assert_eq!(g1, g2, "mismatch for words={:?}", words);
+            }
+        }
+    }
+
+    #[test]
+    fn test_escape_per_mode() {
+        // Default (ERE/PCRE): escapes ( ) { } + ? | . * [ ] ^ $ \ outside classes
+        let (_, p) = generate_with_both_generators(&["f(x)"], &RegexOperator::Default);
+        assert_eq!(p, r"f\(x\)");
+        let (_, p) = generate_with_both_generators(&["a+b?c{1}|d~e/f-g"], &RegexOperator::Default);
+        assert_eq!(p, r"a\+b\?c\{1\}\|d~e/f-g");
+
+        // Vim (magic): does NOT escape ( ) | { } + ?, DOES escape \ . [ ] * ~ ^ $ /
+        let (_, p) = generate_with_both_generators(&["f(x)"], &RegexOperator::VimNonNewline);
+        assert_eq!(p, "f(x)");
+        let (_, p) = generate_with_both_generators(&["a+b?c{1}|d~e/f*g.h"], &RegexOperator::VimNonNewline);
+        assert_eq!(p, r"a+b?c{1}|d\~e\/f\*g\.h");
+
+        // Emacs: does NOT escape ( ) | { }, DOES escape \ . [ ] * + ? ^ $
+        let (_, p) = generate_with_both_generators(&["f(x)"], &RegexOperator::EmacsNonNewline);
+        assert_eq!(p, "f(x)");
+        let (_, p) = generate_with_both_generators(&["f("], &RegexOperator::EmacsNonNewline);
+        assert_eq!(p, "f(");
+        let (_, p) = generate_with_both_generators(&["a+b?c{1}|d~e/f*g.h"], &RegexOperator::EmacsNonNewline);
+        assert_eq!(p, r"a\+b\?c{1}|d~e/f\*g\.h");
+
+        // User-configurable escape set (e.g., cmigemo-style)
+        let custom = RegexOperator::User {
+            or: "|".to_string(),
+            begin_group: "(".to_string(),
+            end_group: ")".to_string(),
+            begin_class: "[".to_string(),
+            end_class: "]".to_string(),
+            newline: String::new(),
+            escape: r"\.*+^$/".to_string(),
+        };
+        let (_, p) = generate_with_both_generators(&["f(x)/y"], &custom);
+        assert_eq!(p, r"f(x)\/y");
+    }
+
+    #[test]
+    fn test_char_class_escaping() {
+        // '-' must not create a range ('+'..'ー')
+        for op in [
+            RegexOperator::Default,
+            RegexOperator::VimNonNewline,
+            RegexOperator::EmacsNonNewline,
+        ] {
+            let (g1, g2) = generate_with_both_generators(&["A+", "A-", "Aー"], &op);
+            assert_eq!(g1, "A[+ー-]");
+            assert_eq!(g2, "A[+ー-]");
+
+            // '-' and '^' alone: '-' first so '^' does not negate
+            let (g1, g2) = generate_with_both_generators(&["a-", "a^"], &op);
+            assert_eq!(g1, "a[-^]");
+            assert_eq!(g2, "a[-^]");
+
+            // Operators like ( ) + ? { inside [...] need no backslashes
+            let (g1, g2) = generate_with_both_generators(&["a(", "a)", "a+", "a?", "a{"], &op);
+            assert_eq!(g1, "a[()+?{]");
+            assert_eq!(g2, "a[()+?{]");
+        }
+
+        // ']' and '\' inside [...]: escaped in Default/Vim, unescaped with ']' first in Emacs
+        let (_, def) = generate_with_both_generators(&["a]", "a\\", "a^", "a-"], &RegexOperator::Default);
+        assert_eq!(def, r"a[\]\\^-]");
+        let (_, vim) = generate_with_both_generators(&["a]", "a\\", "a^", "a-"], &RegexOperator::VimNonNewline);
+        assert_eq!(vim, r"a[\]\\^-]");
+        let (_, emacs) = generate_with_both_generators(&["a]", "a\\", "a^", "a-"], &RegexOperator::EmacsNonNewline);
+        assert_eq!(emacs, r"a[]\^-]");
+    }
+
+    #[test]
+    fn test_generator_compatibility_random() {
+        use rand::rngs::StdRng;
+        use rand::{RngExt, SeedableRng};
+
+        const ALPHABET: &[char] = &[
+            'a', 'b', 'c', 'A', '-', ']', '[', '^', '\\', '(', ')', '{', '}', '+', '*', '?', '.', '|', '~', '/', '$',
+            'あ', 'ー',
+        ];
+        let operators = [
+            RegexOperator::Default,
+            RegexOperator::Vim,
+            RegexOperator::VimNonNewline,
+            RegexOperator::Emacs,
+            RegexOperator::EmacsNonNewline,
+        ];
+        let mut rng = StdRng::seed_from_u64(0x5EED_C0DE);
+
+        for _ in 0..200 {
+            let word_count = rng.random_range(1..=12);
+            let words: Vec<String> = (0..word_count)
+                .map(|_| {
+                    let len = rng.random_range(1..=5);
+                    (0..len)
+                        .map(|_| ALPHABET[rng.random_range(0..ALPHABET.len())])
+                        .collect()
+                })
+                .collect();
+            let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+            for op in &operators {
+                let (g1, g2) = generate_with_both_generators(&refs, op);
+                assert_eq!(g1, g2, "words={:?}", refs);
+            }
+        }
     }
 
     #[test]
     fn test_emacs_regexp_valid_in_emacs() {
         use std::process::Command;
 
-        let (_, pattern) = generate_with_both_generators(&["test", "text"], &RegexOperator::Emacs);
-        let elisp = r#"(let ((re (getenv "MIGEMO_RE")))
-            (unless (and (string-match-p re "test")
-                         (string-match-p re "te st")
-                         (string-match-p re "text")
-                         (with-temp-buffer
-                           (text-mode)
-                           (string-match-p re "te\nst"))
-                         (not (string-match-p re "tent")))
-              (error "unexpected match result for %S" re)))"#;
+        fn elisp_str(s: &str) -> String {
+            let mut out = String::with_capacity(s.len() + 2);
+            out.push('"');
+            for c in s.chars() {
+                match c {
+                    '\\' => out.push_str("\\\\"),
+                    '"' => out.push_str("\\\""),
+                    '\n' => out.push_str("\\n"),
+                    _ => out.push(c),
+                }
+            }
+            out.push('"');
+            out
+        }
+
+        let (_, nl_pattern) = generate_with_both_generators(&["test", "text"], &RegexOperator::Emacs);
+        let cases: &[(&[&str], &[&str], &[&str])] = &[
+            (&["f(x)"], &["f(x)"], &["fx"]),
+            (&["f("], &["f("], &["f"]),
+            (&["a+b?c{1}|d~e/f*g.h"], &["a+b?c{1}|d~e/f*g.h"], &["ab?c{1}|d~e/f*gxh"]),
+            (&["A+", "A-", "Aー"], &["A+", "A-", "Aー"], &["A0", "A\\"]),
+            (&["a-", "a^"], &["a-", "a^"], &["ab"]),
+            (&["a]", "a\\", "a^", "a-"], &["a]", "a\\", "a^", "a-"], &["ab"]),
+            (
+                &["a(", "a)", "a+", "a?", "a{"],
+                &["a(", "a)", "a+", "a?", "a{"],
+                &["a\\"],
+            ),
+        ];
+
+        let mut pairs = String::from("(list");
+        for op in [RegexOperator::Emacs, RegexOperator::EmacsNonNewline] {
+            for (words, should_match, should_not_match) in cases {
+                let (_, re) = generate_with_both_generators(words, &op);
+                let anchored = format!("\\`{}\\'", re);
+                for s in *should_match {
+                    pairs.push_str(&format!(" (list {} {} t)", elisp_str(&anchored), elisp_str(s)));
+                }
+                for s in *should_not_match {
+                    pairs.push_str(&format!(" (list {} {} nil)", elisp_str(&anchored), elisp_str(s)));
+                }
+            }
+        }
+        pairs.push(')');
+
+        let elisp = format!(
+            r#"(progn
+              (let ((re {nl}))
+                (unless (and (string-match-p re "test")
+                             (string-match-p re "te st")
+                             (string-match-p re "text")
+                             (with-temp-buffer (text-mode) (string-match-p re "te\nst"))
+                             (not (string-match-p re "tent")))
+                  (error "unexpected newline match result for %S" re)))
+              (dolist (tc {pairs})
+                (let* ((re (nth 0 tc)) (s (nth 1 tc)) (exp (nth 2 tc))
+                       (got (if (string-match-p re s) t nil)))
+                  (unless (eq got exp)
+                    (error "re=%S str=%S exp=%S got=%S" re s exp got)))))"#,
+            nl = elisp_str(&nl_pattern),
+            pairs = pairs,
+        );
 
         match Command::new("emacs")
-            .args(["--quick", "--batch", "--eval", elisp])
-            .env("MIGEMO_RE", &pattern)
+            .args(["--quick", "--batch", "--eval", &elisp])
             .output()
         {
             Ok(out) => {
                 assert!(
                     out.status.success(),
-                    "emacs rejected pattern {:?}: {}",
-                    pattern,
+                    "emacs regexp verification failed: {}",
                     String::from_utf8_lossy(&out.stderr)
                 );
             }
@@ -295,6 +475,70 @@ mod tests {
                 // Skip if GNU Emacs is not installed in the test environment.
             }
             Err(e) => panic!("failed to invoke emacs: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_vim_regexp_valid_in_vim() {
+        use std::process::Command;
+
+        fn vim_str(s: &str) -> String {
+            format!("'{}'", s.replace('\'', "''"))
+        }
+
+        let cases: &[(&[&str], &[&str], &[&str])] = &[
+            (&["f(x)"], &["f(x)"], &["fx"]),
+            (&["f("], &["f("], &["f"]),
+            (
+                &["a+b?c{1}|d~e/f*g.h"],
+                &["a+b?c{1}|d~e/f*g.h"],
+                &["a+b?c{1}|d~e/f*gxh"],
+            ),
+            (&["A+", "A-", "Aー"], &["A+", "A-", "Aー"], &["A0", "A\\"]),
+            (&["a-", "a^"], &["a-", "a^"], &["ab"]),
+            (&["a]", "a\\", "a^", "a-"], &["a]", "a\\", "a^", "a-"], &["ab"]),
+            (
+                &["a(", "a)", "a+", "a?", "a{"],
+                &["a(", "a)", "a+", "a?", "a{"],
+                &["a\\"],
+            ),
+        ];
+
+        let mut items = Vec::new();
+        for op in [RegexOperator::Vim, RegexOperator::VimNonNewline] {
+            for (words, should_match, should_not_match) in cases {
+                let (_, re) = generate_with_both_generators(words, &op);
+                let anchored = format!("^{}$", re);
+                for s in *should_match {
+                    items.push(format!("[{}, {}, 1]", vim_str(&anchored), vim_str(s)));
+                }
+                for s in *should_not_match {
+                    items.push(format!("[{}, {}, 0]", vim_str(&anchored), vim_str(s)));
+                }
+            }
+        }
+        let cmd = format!(
+            "let cases = [{}] | for c in cases | if (c[1] =~# c[0]) != c[2] | verbose echo 'FAIL' c | cquit! | endif | endfor | qall!",
+            items.join(", ")
+        );
+
+        match Command::new("vim")
+            .args(["-Nu", "NONE", "-es", "-c", &cmd])
+            .stdin(std::process::Stdio::null())
+            .output()
+        {
+            Ok(out) => {
+                assert!(
+                    out.status.success(),
+                    "vim regexp verification failed: {} {}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Skip if Vim is not installed in the test environment.
+            }
+            Err(e) => panic!("failed to invoke vim: {}", e),
         }
     }
 }
