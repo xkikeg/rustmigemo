@@ -247,7 +247,8 @@ mod tests {
 
         let (emacs1, emacs2) = generate_with_both_generators(&["test"], &RegexOperator::Emacs);
         assert_eq!(emacs1, emacs2);
-        assert!(emacs2.contains("\\_s-*"));
+        assert!(emacs2.contains("\\s-*"));
+        assert!(!emacs2.contains("\\_s-*"));
 
         let user_op = RegexOperator::User {
             or: "|".to_string(),
@@ -260,5 +261,40 @@ mod tests {
         let (user1, user2) = generate_with_both_generators(&["bad", "bat"], &user_op);
         assert_eq!(user1, user2);
         assert!(user2.contains("<NL>"));
+    }
+
+    #[test]
+    fn test_emacs_regexp_valid_in_emacs() {
+        use std::process::Command;
+
+        let (_, pattern) = generate_with_both_generators(&["test", "text"], &RegexOperator::Emacs);
+        let elisp = r#"(let ((re (getenv "MIGEMO_RE")))
+            (unless (and (string-match-p re "test")
+                         (string-match-p re "te st")
+                         (string-match-p re "text")
+                         (with-temp-buffer
+                           (text-mode)
+                           (string-match-p re "te\nst"))
+                         (not (string-match-p re "tent")))
+              (error "unexpected match result for %S" re)))"#;
+
+        match Command::new("emacs")
+            .args(["--quick", "--batch", "--eval", elisp])
+            .env("MIGEMO_RE", &pattern)
+            .output()
+        {
+            Ok(out) => {
+                assert!(
+                    out.status.success(),
+                    "emacs rejected pattern {:?}: {}",
+                    pattern,
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Skip if GNU Emacs is not installed in the test environment.
+            }
+            Err(e) => panic!("failed to invoke emacs: {}", e),
+        }
     }
 }
